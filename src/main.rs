@@ -1,45 +1,73 @@
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use ctrlc::set_handler;
 use screenshots::Screen;
-use std::{thread, time::Duration};
-use rusty_tesseract::{Args, Image};
-use image::{RgbaImage, DynamicImage};
+use rusty_tesseract::{Image, Args};
+use tempfile::Builder;
+use tokio::time::{sleep, Duration};
+use futures::future::try_join_all;
+use anyhow::Result;
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+#[tokio::main]
+async fn main() -> Result<()> {
     let search_phrase = "Enter Dungeon";
     let screens = Screen::all()?;
+    let running = Arc::new(AtomicBool::new(true));
+    let r = running.clone();
 
+    set_handler(move || {
+        r.store(false, Ordering::SeqCst);
+    }).expect("Error setting Ctrl-C handler");
     println!("Starting screen monitor...");
-    println!("Looking for phrase: {}", search_phrase);
+    // println!("Looking for phrase: {}", search_phrase);
 
-    loop {
-        for screen in &screens {
-            // Capture screenshot
-            let screenshot = screen.capture()?;
+    let temp_dir = Builder::new()
+        .prefix("screenshot_monitor")
+        .tempdir()?;
 
-            // Create RgbaImage from raw pixels
-            let rgba_image = RgbaImage::from_raw(
-                screenshot.width(),
-                screenshot.height(),
-                screenshot.as_raw().to_vec(),
-            ).expect("Failed to create image from raw data");
+    while running.load(Ordering::SeqCst) {
+        let search_futures: Vec<_> = screens.iter().map(|screen| {
+            let temp_path = temp_dir.path().join(format!("temp_screenshot_{}.png", screen.display_info.id));
+            let search_phrase = search_phrase.to_string();
 
-            // Convert to DynamicImage
-            let dynamic_img = DynamicImage::ImageRgba8(rgba_image);
+            async move {
+                // Capture and save screenshot
+                let image = screen.capture()?;
+                image.save(&temp_path).expect("Failed to save image");
 
-            // Create rusty-tesseract Image
-            let img = Image::from_dynamic_image(&dynamic_img)?;
+                // Set up OCR
+                let img = Image::from_path(&temp_path).expect("Failed to load image");
+                let args = Args::default();
 
-            let args = Args::default();
+                // Perform OCR
+                let text = tokio::task::spawn_blocking(move || {
+                    rusty_tesseract::image_to_string(&img, &args)
+                }).await??;
 
-            // Perform OCR
-            if let Ok(text) = rusty_tesseract::image_to_string(&img, &args) {
-                if text.contains(search_phrase) {
+                let found = text.contains(&search_phrase);
+                if found {
                     println!("Found matching phrase!");
                     println!("Screen: {}", screen.display_info.id);
                     println!("Time: {}", chrono::Local::now());
                 }
-            }
-        }
 
-        thread::sleep(Duration::from_secs(1));
+                if temp_path.exists() {
+                    tokio::fs::remove_file(&temp_path).await?;
+                }
+
+                Ok::<bool, anyhow::Error>(found)
+            }
+        }).collect();
+
+        let results = try_join_all(search_futures).await?;
+        let found = results.into_iter().reduce(|acc, x| acc || x).unwrap_or(false);
+
+        let secs = if found { 2 * 60 } else { 8 };
+        println!("sleeping for {}s", &secs);
+        sleep(Duration::from_secs(secs)).await;
     }
+
+    println!("Exiting...");
+    temp_dir.close()?;
+    Ok(())
 }
