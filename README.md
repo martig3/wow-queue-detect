@@ -1,0 +1,1 @@
+# wow-queue-detect
